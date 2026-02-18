@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  anime-bot:
+    build: .
+    image: anime-discord-bot:latest
+    container_name: anime-discord-bot
+    restart: unless-stopped
+    ports:
+      # Expose the OAuth2 callback server so the browser can reach it.
+      # If deploying behind a reverse proxy (nginx, Caddy, etc.), map this
+      # to your public URL and set OAUTH_REDIRECT_URI accordingly.
+      - "8080:8080"
+    environment:
+      # ── Discord ──────────────────────────────────────────────────────────
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+
+      # ── AnimeSchedule Application Token ─────────────────────────────────
+      # Get from: https://animeschedule.net/users/<username>/settings/api
+      # Used as Bearer token for standard (non-OAuth2) endpoints
+      - ANIMESCHEDULE_APP_TOKEN=${ANIMESCHEDULE_APP_TOKEN}
+
+      # ── AnimeSchedule OAuth2 Credentials ────────────────────────────────
+      # Create an OAuth2 app on the same settings page to get these
+      - ANIMESCHEDULE_CLIENT_ID=${ANIMESCHEDULE_CLIENT_ID}
+      - ANIMESCHEDULE_CLIENT_SECRET=${ANIMESCHEDULE_CLIENT_SECRET}
+
+      # ── OAuth2 Redirect URI ──────────────────────────────────────────────
+      # MUST match the redirect URI registered in your AnimeSchedule app settings.
+      # If running locally:  http://localhost:8080/oauth/callback
+      # If on a server:      https://yourdomain.com/oauth/callback
+      - OAUTH_REDIRECT_URI=${OAUTH_REDIRECT_URI:-http://localhost:8080/oauth/callback}
+
+      # ── Internal callback server port (default 8080) ─────────────────────
+      - OAUTH_CALLBACK_PORT=8080
