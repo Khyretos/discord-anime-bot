@@ -1,0 +1,4 @@
+Japanese|https://animeschedule.net/jpnrss.xml
+Sub|https://animeschedule.net/subrss.xml
+Dub|https://animeschedule.net/dubrss.xml
+News|https://www.animenewsnetwork.com/all/rss.xml?ann-edition

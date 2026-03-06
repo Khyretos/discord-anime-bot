@@ -1,3 +1,4 @@
+
 # 🎌 AnimeSchedule Discord Bot
 
 A Discord bot that delivers anime release schedules, rich show cards, and live RSS feed updates — powered by the [AnimeSchedule.net API v3](https://animeschedule.net/api/v3/documentation).
@@ -9,9 +10,11 @@ A Discord bot that delivers anime release schedules, rich show cards, and live R
 - **Two display modes** — compact list view or rich visual cards, switchable per-command or as a persistent preference
 - **Daily & weekly schedules** — `!today`, `!tomorrow`, and `!week` with automatic 6000-character limit splitting
 - **Visual mode** — one full embed per show including portrait image, synopsis, romaji/japanese/english titles, genres, studio, source, season, release date, episode length, air type, and status
-- **Live RSS feeds** — auto-posts new releases to subscribed channels every 5 minutes across 6 feed types
+- **Live RSS feeds** — auto‑posts new releases to subscribed channels every 5 minutes; only entries from the last 24 hours are delivered; images are automatically extracted when available
+- **Flexible feed configuration** — define your own feeds in `feeds.txt` (name|url per line), no coding required
 - **OAuth2 authentication** — per-user authorization flow for private API endpoints such as your personal anime list
 - **Docker-ready** — ships with a `Dockerfile` and `docker-compose.yml` for one-command deployment
+- **Persistent storage** — subscriptions and seen entry IDs are saved in `bot_data.json`, surviving restarts
 
 ---
 
@@ -46,6 +49,11 @@ A Discord bot that delivers anime release schedules, rich show cards, and live R
 **`list` mode** packs multiple shows into a single embed per day. Each entry shows the show title (linked to its AnimeSchedule page), episode number, and air time. Multiple embeds are created automatically if a day's shows exceed the 6000-character limit.
 
 **`visual` mode** sends one embed per show containing:
+examples:
+
+| List | Visual|
+| ------- | ------- |
+| ![alt text](/images/image-4.png) | ![alt text](/images/image-3.png) |
 
 | Field                    | Source                                           |
 | ------------------------ | ------------------------------------------------ |
@@ -74,24 +82,43 @@ A Discord bot that delivers anime release schedules, rich show cards, and live R
 
 ### 📡 RSS Feeds
 
+The bot can monitor any number of RSS feeds defined in a simple text file.  
+Feeds are fetched live every 5 minutes, and only entries **published within the last 24 hours** are posted. Images are automatically extracted when present in the feed (media:thumbnail, enclosure, etc.).
+
+#### Configuration
+
+1. Create a file named `feeds.txt` in the same directory as `bot.py`.
+2. Add one feed per line in the format:  
+   `Display Name|https://example.com/feed.xml`  
+   Example:
+
+    ```text
+    Japanese|https://animeschedule.net/rss/japanese
+    Subbed|https://animeschedule.net/rss/sub
+    Dubbed|https://animeschedule.net/rss/dub
+    News|<https://www.animenewsnetwork.com/all/rss.xml?ann-edition>
+    ```
+
+3. Restart the bot (or it will reload on next poll cycle).
+4. examples
+
+| Japanese | Dub|
+| ------- | ------- |
+| ![alt text](/images/image.png) | ![alt text](/images/image-1.png) |
+
+| Sub | news |
+| ------- | ------- |
+|  ![alt text](/images/image-2.png) | ![alt text](/images/image-1.png) |
+
+#### Commands
+
 | Command               | Description                                                          |
 | --------------------- | -------------------------------------------------------------------- |
-| `!feed list`          | Show all available feeds and which ones this server is subscribed to |
-| `!feed enable <key>`  | Subscribe the current channel to a feed                              |
-| `!feed disable <key>` | Unsubscribe from a feed                                              |
+| `!feed list`          | Show all configured feeds and which ones this channel is subscribed to |
+| `!feed enable <name>` | Subscribe the current channel to a feed (by display name)           |
+| `!feed disable <name>`| Unsubscribe from a feed                                              |
 
-**Available feed keys:**
-
-| Key        | Feed                       |
-| ---------- | -------------------------- |
-| `japanese` | 🇯🇵 Japanese Anime (Raw)    |
-| `sub`      | 📺 Anime (Subbed)          |
-| `dub`      | 🔊 Anime (Dubbed)          |
-| `chinese`  | 🇨🇳 Chinese Anime / Donghua |
-| `manga`    | 📚 Manga                   |
-| `manhwa`   | 📖 Manhwa                  |
-
-The RSS poller runs every **5 minutes**. On startup it seeds the seen-entry cache from each subscribed feed so it won't re-post historical entries when the bot restarts. New entries are posted as embeds with the show title, a clickable link, summary text, and image (when available from the feed).
+Subscriptions are saved in `bot_data.json` and survive restarts.
 
 ---
 
@@ -104,15 +131,19 @@ The RSS poller runs every **5 minutes**. On startup it seeds the seen-entry cach
 | `!authstatus` | Check whether you're authorized and how long until your token expires |
 | `!animelist`  | View your personal AnimeSchedule anime list _(requires `!login`)_     |
 
----
+### 📆 Daily Announcements
+
+| Command               | Description                                                   |
+| --------------------- | ------------------------------------------------------------- |
+| `!daily enable`       | Enable daily schedule posts in this channel at 00:00 UTC      |
+| `!daily disable`      | Disable daily announcements                                   |
+| `!daily`              | Show current daily announcement status for this server        |
 
 ### ℹ️ General
 
 | Command | Description                                     |
 | ------- | ----------------------------------------------- |
 | `!help` | Show all commands and your current display mode |
-
----
 
 ## 🔐 Authentication Architecture
 
@@ -150,8 +181,6 @@ User runs !login
 Tokens expire after **3600 seconds** (1 hour) per the API spec. The bot automatically refreshes them using the refresh token before any protected API call. If a refresh fails the user is asked to run `!login` again.
 
 The built-in OAuth2 callback server runs on `OAUTH_CALLBACK_PORT` (default: `8080`) alongside the bot using `aiohttp`.
-
----
 
 ## 🚀 Setup
 
@@ -201,8 +230,6 @@ OAUTH_REDIRECT_URI=http://localhost:8080/oauth/callback
 # Port for the built-in OAuth2 callback server (default: 8080)
 OAUTH_CALLBACK_PORT=8080
 ```
-
----
 
 ## 🐳 Deployment
 
@@ -255,8 +282,6 @@ location /oauth/callback {
 }
 ```
 
----
-
 ## 📦 Dependencies
 
 | Package         | Purpose                                                    |
@@ -272,21 +297,19 @@ Install with:
 pip install -r requirements.txt
 ```
 
----
-
 ## 🗂️ Project Structure
 
-```
+```text
 anime-discord-bot/
-├── bot.py              # All bot logic — OAuth2, API calls, embeds, commands, RSS
-├── requirements.txt    # Python dependencies
-├── Dockerfile          # Container build (Python 3.12-slim, exposes port 8080)
-├── docker-compose.yml  # One-command deployment with env var passthrough
-├── .env.example        # Environment variable template
-└── README.md           # This file
+├── bot.py              # All bot logic
+├── feeds.txt           # RSS feed definitions (name|url per line)
+├── bot_data.json       # Persistent storage (created automatically)
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
+└── README.md
 ```
-
----
 
 ## ⚙️ Technical Notes
 
@@ -313,3 +336,17 @@ The AnimeSchedule v3 API returns **camelCase** field names for timetable objects
 ### Image URLs
 
 Show images are served from `https://img.animeschedule.net/production/assets/public/img/` using the `imageVersionRoute` field (a versioned path separate from the show's URL `route`). The bot uses this field directly — do not substitute `route` for `imageVersionRoute` as they are different values.
+
+### RSS feed handling
+
+- Feeds are fetched live every 5 minutes.
+
+- Only entries with a valid pubDate within the last 24 hours are posted.
+
+- Images are extracted from common RSS fields (media:thumbnail, media:content, * enclosures, itunes:image, and <img> tags in description).
+
+- Seen entry GUIDs are stored in bot_data.json to avoid reposts after restarts.
+
+### State persistence
+
+All subscriptions and seen entry IDs are saved to bot_data.json on every change, ensuring the bot remembers what it has posted even after a crash or restart.

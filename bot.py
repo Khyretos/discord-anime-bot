@@ -2,23 +2,23 @@
 AnimeSchedule Discord Bot
 OAuth2-authenticated access to animeschedule.net API v3.
 
-OAuth2 Flow:
-  - Application token (env var) → used for all non-OAuth2 endpoints (timetables, shows, etc.)
-  - Per-user OAuth2 tokens      → used for OAuth2-only endpoints (animelists, etc.)
-
-A lightweight aiohttp web server handles the OAuth2 callback on OAUTH_REDIRECT_URI.
-
-Display modes:
-  - list   (default) → compact summary embeds, multiple shows per embed, char-limit-safe
-  - visual           → one rich embed per show with image, genres, studio, synopsis, etc.
+RSS feeds are loaded from 'feeds.txt' (name|url per line).
+Feeds are fetched live every 5 minutes.
+Only entries from the last 24 hours are posted.
+Images are extracted automatically when available.
 """
 
 import asyncio
+import calendar
+import json
 import logging
 import os
+import re
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
+from datetime import time as datetime_time
+from pathlib import Path
 from urllib.parse import urlencode
 
 import aiohttp
@@ -36,7 +36,6 @@ logging.basicConfig(
 log = logging.getLogger("anime-bot")
 
 # ─── Environment variables ────────────────────────────────────────────────────
-# Load environment variables from .env file
 load_dotenv()
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
@@ -58,33 +57,55 @@ OAUTH_TOKEN_URL = f"{BASE_API}/oauth2/token"
 OAUTH_REVOKE_URL = f"{BASE_API}/oauth2/revoke"
 
 # Discord hard limits
-EMBED_CHAR_LIMIT = 6000  # total characters per embed
-FIELD_VALUE_LIMIT = 1024  # per-field value limit
-EMBEDS_PER_MESSAGE = 5  # max embeds per message() call
+EMBED_CHAR_LIMIT = 6000
+FIELD_VALUE_LIMIT = 1024
+EMBEDS_PER_MESSAGE = 5
 
-# ─── RSS feed registry ────────────────────────────────────────────────────────
-RSS_FEEDS = {
-    "japanese": {
-        "label": "🇯🇵 Japanese Anime (Raw)",
-        "url": "https://animeschedule.net/rss/japanese",
-    },
-    "sub": {"label": "📺 Anime (Subbed)", "url": "https://animeschedule.net/rss/sub"},
-    "dub": {"label": "🔊 Anime (Dubbed)", "url": "https://animeschedule.net/rss/dub"},
-    "chinese": {
-        "label": "🇨🇳 Chinese Anime (Donghua)",
-        "url": "https://animeschedule.net/rss/donghua",
-    },
-    "manga": {"label": "📚 Manga", "url": "https://animeschedule.net/rss/manga"},
-    "manhwa": {"label": "📖 Manhwa", "url": "https://animeschedule.net/rss/manhwa"},
-}
+# ─── RSS feeds file ───────────────────────────────────────────────────────────
+FEEDS_FILE = Path("feeds.txt")
 
-# ─── In-memory state ─────────────────────────────────────────────────────────
-feed_subscriptions: dict[int, dict[str, int]] = {}
-seen_entries: dict[str, set] = {k: set() for k in RSS_FEEDS}
-pending_oauth: dict[str, tuple[int, int]] = {}
+# Structure: {feed_name: feed_url}
+RSS_FEEDS: dict[str, str] = {}
 
-# Per-user display mode preference: discord_user_id -> "list" | "visual"
-user_display_mode: dict[int, str] = {}
+
+def load_feeds_from_file():
+    """Read feeds.txt and populate RSS_FEEDS."""
+    global RSS_FEEDS
+    RSS_FEEDS.clear()
+    if not FEEDS_FILE.exists():
+        log.warning("feeds.txt not found – no RSS feeds available.")
+        return
+    with open(FEEDS_FILE, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "|" not in line:
+                log.warning("feeds.txt line %d: missing '|', skipping", line_num)
+                continue
+            name, url = line.split("|", 1)
+            name = name.strip()
+            url = url.strip()
+            if not name or not url:
+                log.warning("feeds.txt line %d: empty name or URL, skipping", line_num)
+                continue
+            RSS_FEEDS[name] = url
+    log.info("Loaded %d RSS feeds from feeds.txt", len(RSS_FEEDS))
+
+
+# ─── Persistent data file ─────────────────────────────────────────────────────
+DATA_FILE = Path("bot_data.json")
+
+# ─── Persistent state (loaded from / saved to JSON) ─────────────────────────
+feed_subscriptions: dict[
+    int, dict[str, int]
+] = {}  # guild_id -> {feed_name: channel_id}
+seen_entries: dict[str, set] = {}  # feed_url -> set of entry guids
+daily_channels: dict[int, int] = {}  # guild_id -> channel_id
+
+# ─── Non‑persistent state ───────────────────────────────────────────────────
+pending_oauth: dict[str, tuple[int, int]] = {}  # state -> (user_id, channel_id)
+user_display_mode: dict[int, str] = {}  # user_id -> "list"/"visual"
 
 
 class OAuthToken:
@@ -98,6 +119,88 @@ class OAuthToken:
 
 
 user_oauth_tokens: dict[int, OAuthToken] = {}
+
+# ─── Persistent data helpers ─────────────────────────────────────────────────
+
+
+def load_data():
+    global feed_subscriptions, seen_entries, daily_channels
+    if not DATA_FILE.exists():
+        return
+    try:
+        with open(DATA_FILE, "r") as f:
+            data = json.load(f)
+    except Exception as e:
+        log.error("Failed to load data: %s", e)
+        return
+
+    feed_subscriptions = {
+        int(g): v for g, v in data.get("feed_subscriptions", {}).items()
+    }
+    seen_entries = {k: set(v) for k, v in data.get("seen_entries", {}).items()}
+    daily_channels = {int(g): v for g, v in data.get("daily_channels", {}).items()}
+
+
+def save_data():
+    data = {
+        "feed_subscriptions": feed_subscriptions,
+        "seen_entries": {k: list(v) for k, v in seen_entries.items()},
+        "daily_channels": daily_channels,
+    }
+    try:
+        with open(DATA_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log.error("Failed to save data: %s", e)
+
+
+# ─── RSS helpers ────────────────────────────────────────────────────────────
+
+
+def parse_entry_date(entry) -> datetime | None:
+    """Convert feedparser's published_parsed to UTC datetime, or return None."""
+    if hasattr(entry, "published_parsed") and entry.published_parsed:
+        return datetime.fromtimestamp(
+            calendar.timegm(entry.published_parsed), tz=timezone.utc
+        )
+    return None
+
+
+def extract_image_from_entry(entry) -> str | None:
+    """
+    Try to extract an image URL from an RSS entry.
+    Checks: media:thumbnail, media:content, enclosure, itunes:image, and description.
+    """
+    if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
+        for thumb in entry.media_thumbnail:
+            url = thumb.get("url")
+            if url:
+                return url
+
+    if hasattr(entry, "media_content") and entry.media_content:
+        for mc in entry.media_content:
+            if mc.get("type", "").startswith("image"):
+                url = mc.get("url")
+                if url:
+                    return url
+
+    if hasattr(entry, "enclosures") and entry.enclosures:
+        for enc in entry.enclosures:
+            if enc.get("type", "").startswith("image"):
+                url = enc.get("href") or enc.get("url")
+                if url:
+                    return url
+
+    if hasattr(entry, "itunes_image") and entry.itunes_image:
+        return entry.itunes_image.get("href")
+
+    if hasattr(entry, "description") and entry.description:
+        match = re.search(r'<img[^>]+src="([^">]+)"', entry.description)
+        if match:
+            return match.group(1)
+
+    return None
+
 
 # ─── Colours ─────────────────────────────────────────────────────────────────
 EMBED_COLOUR = discord.Colour.from_str("#7289DA")
@@ -115,7 +218,6 @@ WEEKDAY_COLOURS = (
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # OAuth2 helpers
@@ -314,7 +416,6 @@ def oauth_headers(access_token: str) -> dict:
 async def fetch_timetable(
     session: aiohttp.ClientSession, air_type: str = "sub"
 ) -> list:
-    """GET /api/v3/timetables/{airType}  —  Application token"""
     url = f"{BASE_API}/timetables/{air_type}"
     async with session.get(url, headers=app_headers()) as resp:
         if resp.status == 401:
@@ -328,7 +429,6 @@ async def fetch_timetable(
 
 
 async def fetch_animelist(session: aiohttp.ClientSession, access_token: str) -> list:
-    """GET /api/v3/animelists  —  OAuth2 token required"""
     url = f"{BASE_API}/animelists"
     async with session.get(url, headers=oauth_headers(access_token)) as resp:
         if resp.status == 401:
@@ -342,12 +442,6 @@ async def fetch_animelist(session: aiohttp.ClientSession, access_token: str) -> 
 
 
 async def fetch_show_detail(session: aiohttp.ClientSession, route: str) -> dict | None:
-    """
-    GET /api/v3/shows/{route}  —  Application token
-    Returns full ShowDetail with PascalCase fields:
-    Names{Romaji,English,Japanese}, Description, Genres[], Studios[],
-    Sources[], MediaTypes[], LengthMin, Premier, Season, Status, ImageVersionRoute
-    """
     url = f"{BASE_API}/shows/{route}"
     try:
         async with session.get(url, headers=app_headers()) as resp:
@@ -369,11 +463,6 @@ async def fetch_show_detail(session: aiohttp.ClientSession, route: str) -> dict 
 
 
 def get_show_image(image_version_route: str) -> str:
-    """
-    Build the correct image URL.
-    The API returns ImageVersionRoute (e.g. "some-show-name/abc123") which is
-    different from Route. Images are served as .webp files.
-    """
     if image_version_route:
         return f"{IMAGE_BASE}/{image_version_route}"
     return ""
@@ -439,7 +528,6 @@ def group_by_weekday(shows: list) -> dict[str, list]:
 
 
 def embed_char_count(embed: discord.Embed) -> int:
-    """Rough character count matching Discord's 6000-char limit calculation."""
     total = len(embed.title or "")
     total += len(embed.description or "")
     for field in embed.fields:
@@ -456,8 +544,6 @@ def embed_char_count(embed: discord.Embed) -> int:
 # Embed builders
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Visual mode: one rich embed per show ──────────────────────────────────────
-
 
 def make_visual_embed(
     timetable_show: dict,
@@ -468,16 +554,8 @@ def make_visual_embed(
     Build a full-detail embed from:
       - timetable_show  (TimetableShow, PascalCase fields from /api/v3/timetables)
       - detail          (ShowDetail, PascalCase fields from /api/v3/shows/{route}, may be None)
-
-    TimetableShow fields used: Title, Romaji, English, Japanese, Route,
-        ImageVersionRoute, AirType, AiringStatus, EpisodeDate, EpisodeNumber,
-        Episodes, LengthMin, Status
-    ShowDetail fields used: Names{Romaji,English,Japanese}, Description,
-        Genres[]{Name}, Studios[]{Name}, Sources[]{Name}, MediaTypes[]{Name},
-        LengthMin, Premier, Season{Season,Year}, Status, ImageVersionRoute
     """
-    # ── Titles ────────────────────────────────────────────────────────────────
-    # Prefer ShowDetail Names over timetable flat fields
+    # Titles
     names = (detail or {}).get("names") or {}
     title_main = (
         timetable_show.get("title")
@@ -491,28 +569,26 @@ def make_visual_embed(
     title_jp = names.get("japanese") or timetable_show.get("japanese") or ""
     route = timetable_show.get("route", "")
 
-    # ── Image ─────────────────────────────────────────────────────────────────
-    # ImageVersionRoute is a versioned path like "my-show/a1b2c3", distinct from Route.
+    # Image
     img_ver = (
         (detail or {}).get("ImageVersionRoute")
         or timetable_show.get("imageVersionRoute")
         or ""
     )
-
     image_url = get_show_image(img_ver)
 
-    # ── Synopsis ──────────────────────────────────────────────────────────────
+    # Synopsis
     synopsis_raw = (detail or {}).get("Description") or ""
     synopsis = synopsis_raw[:400] + ("…" if len(synopsis_raw) > 400 else "")
 
-    # ── Episode / air info from timetable ────────────────────────────────────
+    # Episode info
     ep_date = parse_date(timetable_show.get("episodeDate"))
     ep_num = timetable_show.get("episodeNumber")
     ep_total = timetable_show.get("episodes") or (detail or {}).get("episodes")
     air_type = timetable_show.get("airType", "")
     length = timetable_show.get("lengthMin") or (detail or {}).get("lengthMin")
 
-    # ── Status / airing ───────────────────────────────────────────────────────
+    # Status
     status = (
         (detail or {}).get("status")
         or timetable_show.get("airingStatus")
@@ -520,7 +596,7 @@ def make_visual_embed(
         or ""
     )
 
-    # ── Release date / season ─────────────────────────────────────────────────
+    # Release date / season
     premier_raw = (
         (detail or {}).get("premier") or (detail or {}).get("subPremier") or ""
     )
@@ -534,7 +610,7 @@ def make_visual_embed(
         f"{season_name} {season_year}".strip() if season_name or season_year else ""
     )
 
-    # ── Metadata from ShowDetail ───────────────────────────────────────────────
+    # Metadata
     def keyword_names(lst, limit=6):
         if not isinstance(lst, list):
             return ""
@@ -547,7 +623,7 @@ def make_visual_embed(
 
     air_labels = {"raw": "Raw 🇯🇵", "sub": "Subbed 📝", "dub": "Dubbed 🔊"}
 
-    # ── Build embed ───────────────────────────────────────────────────────────
+    # Build embed
     embed = discord.Embed(
         title=title_main,
         url=get_show_url(route),
@@ -555,11 +631,10 @@ def make_visual_embed(
         colour=colour,
     )
 
-    # Portrait image — this is what was broken before: wrong field name + wrong extension
     if image_url:
         embed.set_image(url=image_url)
 
-    # ── Alternate titles ──────────────────────────────────────────────────────
+    # Alternate titles
     if title_ro and title_ro != title_main:
         embed.add_field(name="🔤 Romaji", value=title_ro, inline=False)
     if title_jp and title_jp != title_main:
@@ -567,7 +642,7 @@ def make_visual_embed(
     if title_en and title_en != title_main:
         embed.add_field(name="🌐 English", value=title_en, inline=False)
 
-    # ── Air / episode details ─────────────────────────────────────────────────
+    # Air / episode details
     if ep_date:
         embed.add_field(
             name="🗓️ Ep Day", value=WEEKDAY_COLOURS[ep_date.weekday()][1], inline=True
@@ -588,7 +663,7 @@ def make_visual_embed(
     if status:
         embed.add_field(name="📊 Status", value=status, inline=True)
 
-    # ── Production / release ─────────────────────────────────────────────────
+    # Production / release
     if release_str:
         embed.add_field(name="📅 Release Date", value=release_str, inline=True)
     if season_str:
@@ -606,9 +681,6 @@ def make_visual_embed(
     return embed
 
 
-# ── List mode: compact summary embeds, multiple shows per embed ───────────────
-
-
 def _make_empty_list_embed(title: str, colour: discord.Colour) -> discord.Embed:
     embed = discord.Embed(title=title, colour=colour)
     embed.set_footer(text="AnimeSchedule.net")
@@ -621,17 +693,11 @@ def make_list_embeds(
     colour: discord.Colour = EMBED_COLOUR,
     shows_per_embed: int = 15,
 ) -> list[discord.Embed]:
-    """
-    Pack shows into compact list embeds that never exceed Discord's 6000-char limit.
-    Each field = one show line.  We check the running char count before adding each
-    field and open a new embed if adding it would breach the limit.
-    """
     embeds: list[discord.Embed] = []
     current = _make_empty_list_embed(section_title, colour)
     show_count = 0
 
     for show in shows:
-        # API returns PascalCase: Title, Romaji, EpisodeDate, EpisodeNumber, Route
         title = show.get("title") or show.get("romaji") or "Unknown"
         ep_d = parse_date(show.get("episodeDate"))
         ep_num = show.get("episodeNumber", "?")
@@ -640,17 +706,13 @@ def make_list_embeds(
         field_name = f"{title}"
         field_value = f"[Episode {ep_num} · {fmt_time(ep_d)}]({get_show_url(route)})"
 
-        # Estimate chars this field would add
         added_chars = len(field_name) + len(field_value)
 
-        # Check hard limits: 6000 total chars OR 25 fields per embed
         if (
-            embed_char_count(current) + added_chars
-            > EMBED_CHAR_LIMIT - 100  # 100-char safety buffer
+            embed_char_count(current) + added_chars > EMBED_CHAR_LIMIT - 100
             or len(current.fields) >= 25
         ):
             embeds.append(current)
-            # Continuation embed — no title to save chars; use a compact header
             current = _make_empty_list_embed(f"{section_title} (cont.)", colour)
 
         current.add_field(name=field_name, value=field_value, inline=False)
@@ -659,7 +721,6 @@ def make_list_embeds(
     if len(current.fields) > 0:
         embeds.append(current)
 
-    # Stamp final embed with total count
     if embeds:
         last = embeds[-1]
         last.set_footer(text=f"AnimeSchedule.net · {show_count} releases")
@@ -667,14 +728,10 @@ def make_list_embeds(
     return embeds
 
 
-# ── Weekly list mode: one "section" per day, each section char-limit-safe ─────
-
-
 def make_week_list_embeds(
     groups: dict[str, list],
     today: datetime.date,
 ) -> list[discord.Embed]:
-    """Build all the week's list embeds, day by day, splitting where needed."""
     weekdays = [
         "Monday",
         "Tuesday",
@@ -703,41 +760,22 @@ def make_week_list_embeds(
     return all_embeds
 
 
-# ── RSS embeds ────────────────────────────────────────────────────────────────
-
-
-def make_rss_embed(entry: dict, feed_key: str) -> discord.Embed:
+def make_rss_embed(
+    entry: dict, feed_name: str, image_url: str | None = None
+) -> discord.Embed:
     title = entry.get("title", "New Release")
     link = entry.get("link", "")
     summary = (entry.get("summary") or "")[:350]
 
-    image_url = None
-    for thumb in entry.get("media_thumbnail", []):
-        image_url = thumb.get("url")
-        break
-    if not image_url:
-        for mc in entry.get("media_content", []):
-            if (mc.get("type") or "").startswith("image"):
-                image_url = mc.get("url")
-                break
-
-    colour_map = {
-        "japanese": discord.Colour.red(),
-        "sub": discord.Colour.blue(),
-        "dub": discord.Colour.green(),
-        "chinese": discord.Colour.gold(),
-        "manga": discord.Colour.purple(),
-        "manhwa": discord.Colour.teal(),
-    }
     embed = discord.Embed(
         title=title,
         url=link if link else None,
         description=summary if summary else None,
-        colour=colour_map.get(feed_key, EMBED_COLOUR),
+        colour=EMBED_COLOUR,
     )
     if image_url:
         embed.set_image(url=image_url)
-    embed.set_author(name=f"New Release · {RSS_FEEDS[feed_key]['label']}")
+    embed.set_author(name=f"New Release · {feed_name}")
     embed.set_footer(text="AnimeSchedule.net")
     return embed
 
@@ -748,7 +786,6 @@ def make_rss_embed(entry: dict, feed_key: str) -> discord.Embed:
 
 
 async def send_embeds(ctx, embeds: list[discord.Embed], header: str | None = None):
-    """Send any number of embeds, batching into messages of ≤10 each."""
     if not embeds:
         await ctx.send("📭 No releases found.")
         return
@@ -761,10 +798,6 @@ async def send_embeds(ctx, embeds: list[discord.Embed], header: str | None = Non
 async def send_visual(
     ctx, shows: list, header: str | None = None, colour: discord.Colour = EMBED_COLOUR
 ):
-    """
-    Send one rich visual embed per show.
-    Fetches ShowDetail for each show to get full info (genres, studios, synopsis, etc.).
-    """
     if not shows:
         await ctx.send("📭 No releases found.")
         return
@@ -774,7 +807,6 @@ async def send_visual(
     async with aiohttp.ClientSession() as session:
         for i, show in enumerate(shows):
             route = show.get("route", "")
-            # Fetch full ShowDetail for this show (has genres, studios, description, etc.)
             detail = await fetch_show_detail(session, route) if route else None
 
             c = (
@@ -784,13 +816,11 @@ async def send_visual(
             )
             embed = make_visual_embed(show, detail, c)
             await ctx.send(embed=embed)
-            # Avoid Discord rate limits on large batches
             if (i + 1) % 5 == 0:
                 await asyncio.sleep(1.5)
 
 
 def get_mode(ctx: commands.Context, explicit: str) -> str:
-    """Resolve display mode: explicit arg > user preference > default 'list'."""
     if explicit in ("list", "visual"):
         return explicit
     return user_display_mode.get(ctx.author.id, "list")
@@ -803,14 +833,6 @@ def get_mode(ctx: commands.Context, explicit: str) -> str:
 
 @bot.command(name="mode")
 async def cmd_mode(ctx: commands.Context, mode: str = ""):
-    """
-    Set your preferred display mode for !today, !tomorrow, !week.
-
-    Usage:
-      !mode list    — compact summary (default)
-      !mode visual  — one rich embed per show (image, genres, studio, etc.)
-      !mode         — show current setting
-    """
     mode = mode.lower()
     if mode not in ("list", "visual", ""):
         await ctx.send("❌ Valid modes: `list` or `visual`")
@@ -841,14 +863,6 @@ async def cmd_mode(ctx: commands.Context, mode: str = ""):
 
 @bot.command(name="today")
 async def cmd_today(ctx: commands.Context, mode: str = ""):
-    """
-    Show anime releases today.
-
-    Usage:
-      !today           — use your saved mode preference
-      !today list      — compact list
-      !today visual    — rich card per show
-    """
     async with ctx.typing():
         async with aiohttp.ClientSession() as session:
             shows = await fetch_timetable(session, "sub")
@@ -877,14 +891,6 @@ async def cmd_today(ctx: commands.Context, mode: str = ""):
 
 @bot.command(name="tomorrow")
 async def cmd_tomorrow(ctx: commands.Context, mode: str = ""):
-    """
-    Show anime releases tomorrow.
-
-    Usage:
-      !tomorrow           — use your saved mode preference
-      !tomorrow list      — compact list
-      !tomorrow visual    — rich card per show
-    """
     async with ctx.typing():
         async with aiohttp.ClientSession() as session:
             shows = await fetch_timetable(session, "sub")
@@ -911,14 +917,6 @@ async def cmd_tomorrow(ctx: commands.Context, mode: str = ""):
 
 @bot.command(name="week")
 async def cmd_week(ctx: commands.Context, mode: str = ""):
-    """
-    Show the full weekly schedule.
-
-    Usage:
-      !week           — use your saved mode preference
-      !week list      — compact list, one embed per day (auto-splits if >6000 chars)
-      !week visual    — rich card per show (sends many embeds — can be slow)
-    """
     async with ctx.typing():
         async with aiohttp.ClientSession() as session:
             shows = await fetch_timetable(session, "sub")
@@ -933,7 +931,6 @@ async def cmd_week(ctx: commands.Context, mode: str = ""):
     header = f"📆 **Weekly Anime Schedule** — {len(shows)} total releases"
 
     if display == "visual":
-        # Flatten all shows ordered by date
         weekdays = [
             "Monday",
             "Tuesday",
@@ -957,7 +954,6 @@ async def cmd_week(ctx: commands.Context, mode: str = ""):
 
 @bot.command(name="login")
 async def cmd_login(ctx: commands.Context):
-    """Start the OAuth2 authorization flow (DMs you the link)."""
     state = secrets.token_urlsafe(32)
     pending_oauth[state] = (ctx.author.id, ctx.channel.id)
     auth_url = build_authorize_url(state, scope="animelist")
@@ -983,7 +979,6 @@ async def cmd_login(ctx: commands.Context):
 
 @bot.command(name="logout")
 async def cmd_logout(ctx: commands.Context):
-    """Revoke your AnimeSchedule OAuth2 token."""
     tok = user_oauth_tokens.get(ctx.author.id)
     if not tok:
         await ctx.send("ℹ️ You are not currently logged in.")
@@ -999,7 +994,6 @@ async def cmd_logout(ctx: commands.Context):
 
 @bot.command(name="authstatus")
 async def cmd_authstatus(ctx: commands.Context):
-    """Check your OAuth2 authorization status."""
     tok = user_oauth_tokens.get(ctx.author.id)
     if not tok:
         embed = discord.Embed(
@@ -1025,7 +1019,6 @@ async def cmd_authstatus(ctx: commands.Context):
 
 @bot.command(name="animelist")
 async def cmd_animelist(ctx: commands.Context):
-    """Show your AnimeSchedule anime list (requires !login)."""
     async with aiohttp.ClientSession() as session:
         access_token = await get_valid_access_token(session, ctx.author.id)
         if not access_token:
@@ -1039,7 +1032,6 @@ async def cmd_animelist(ctx: commands.Context):
         await ctx.send("📭 Your anime list is empty or could not be retrieved.")
         return
 
-    # Pack entries into char-limit-safe embeds
     all_embeds: list[discord.Embed] = []
     current = discord.Embed(
         title=f"📋 {ctx.author.display_name}'s Anime List",
@@ -1047,7 +1039,6 @@ async def cmd_animelist(ctx: commands.Context):
     )
 
     for entry in entries:
-        # animelists endpoint may return PascalCase or camelCase — handle both
         title = entry.get("title") or entry.get("route") or "Unknown"
         ep_seen = entry.get("EpisodesSeen") or entry.get("episodesSeen") or 0
         ep_total = entry.get("Episodes") or entry.get("episodes")
@@ -1076,19 +1067,15 @@ async def cmd_animelist(ctx: commands.Context):
 
 
 @bot.command(name="feed")
-async def cmd_feed(ctx: commands.Context, action: str = "", feed_key: str = ""):
-    """
-    Manage RSS feed subscriptions for this channel.
-
-    Usage:
-      !feed list              — show available feeds and current subscriptions
-      !feed enable <key>      — subscribe this channel to a feed
-      !feed disable <key>     — unsubscribe from a feed
-
-    Keys: japanese · sub · dub · chinese · manga · manhwa
-    """
+async def cmd_feed(ctx: commands.Context, action: str = "", feed_name: str = ""):
     if not ctx.guild:
         await ctx.send("❌ This command must be used in a server.")
+        return
+
+    if not RSS_FEEDS:
+        await ctx.send(
+            "❌ No RSS feeds configured. The bot owner must create a `feeds.txt` file."
+        )
         return
 
     guild_id = ctx.guild.id
@@ -1099,49 +1086,90 @@ async def cmd_feed(ctx: commands.Context, action: str = "", feed_key: str = ""):
         embed = discord.Embed(
             title="📡 RSS Feed Subscriptions",
             description=(
-                "`!feed enable <key>` — subscribe this channel\n"
-                "`!feed disable <key>` — unsubscribe\n\n"
-                "**Keys:** `japanese` · `sub` · `dub` · `chinese` · `manga` · `manhwa`"
+                "`!feed enable <name>` — subscribe this channel\n"
+                "`!feed disable <name>` — unsubscribe\n\n"
+                f"**Available feeds:**\n" + "\n".join(f"`{name}`" for name in RSS_FEEDS)
             ),
             colour=EMBED_COLOUR,
         )
-        for key, info in RSS_FEEDS.items():
-            sub_ch = subs.get(key)
+        for name in RSS_FEEDS:
+            sub_ch = subs.get(name)
             if sub_ch == ctx.channel.id:
                 status = "✅ Subscribed (this channel)"
             elif sub_ch:
                 status = f"🔗 Subscribed in <#{sub_ch}>"
             else:
                 status = "❌ Not subscribed"
-            embed.add_field(
-                name=f"`{key}` — {info['label']}", value=status, inline=False
-            )
+            embed.add_field(name=f"`{name}`", value=status, inline=False)
         await ctx.send(embed=embed)
 
     elif action == "enable":
-        if feed_key not in RSS_FEEDS:
+        if feed_name not in RSS_FEEDS:
             await ctx.send(
-                f"❌ Unknown key `{feed_key}`. Valid: {', '.join(f'`{k}`' for k in RSS_FEEDS)}"
+                f"❌ Unknown feed name `{feed_name}`. Available: {', '.join(f'`{n}`' for n in RSS_FEEDS)}"
             )
             return
-        feed_subscriptions.setdefault(guild_id, {})[feed_key] = ctx.channel.id
+        feed_subscriptions.setdefault(guild_id, {})[feed_name] = ctx.channel.id
+        save_data()
         await ctx.send(
-            f"✅ {ctx.channel.mention} subscribed to **{RSS_FEEDS[feed_key]['label']}**.\n"
-            "New releases will be posted here every 5 minutes."
+            f"✅ {ctx.channel.mention} subscribed to **{feed_name}**.\n"
+            "New entries from this feed (posted within the last 24h) will be delivered here every 5 minutes."
         )
 
     elif action == "disable":
-        if feed_key not in RSS_FEEDS:
-            await ctx.send(f"❌ Unknown key `{feed_key}`.")
+        if feed_name not in RSS_FEEDS:
+            await ctx.send(f"❌ Unknown feed name `{feed_name}`.")
             return
         subs = feed_subscriptions.get(guild_id, {})
-        if feed_key in subs:
-            del subs[feed_key]
-            await ctx.send(f"🗑️ Unsubscribed from **{RSS_FEEDS[feed_key]['label']}**.")
+        if feed_name in subs:
+            del subs[feed_name]
+            save_data()
+            await ctx.send(f"🗑️ Unsubscribed from **{feed_name}**.")
         else:
-            await ctx.send(f"ℹ️ Not subscribed to `{feed_key}`.")
+            await ctx.send(f"ℹ️ Not subscribed to `{feed_name}`.")
     else:
-        await ctx.send("❓ Usage: `!feed list | enable <key> | disable <key>`")
+        await ctx.send("❓ Usage: `!feed list | enable <name> | disable <name>`")
+
+
+@bot.command(name="daily")
+async def cmd_daily(ctx: commands.Context, action: str = ""):
+    if not ctx.guild:
+        await ctx.send("❌ This command must be used in a server.")
+        return
+
+    guild_id = ctx.guild.id
+    action = action.lower()
+
+    if action == "":
+        chan_id = daily_channels.get(guild_id)
+        if chan_id:
+            channel = bot.get_channel(chan_id)
+            status = f"✅ Daily announcements are enabled in {channel.mention if channel else 'a deleted channel'}."
+        else:
+            status = "❌ Daily announcements are disabled."
+        embed = discord.Embed(
+            title="📆 Daily Schedule Announcement",
+            description=status
+            + "\n\nUse `!daily enable` to set this channel, or `!daily disable` to turn off.",
+            colour=EMBED_COLOUR,
+        )
+        await ctx.send(embed=embed)
+
+    elif action == "enable":
+        daily_channels[guild_id] = ctx.channel.id
+        save_data()
+        await ctx.send(f"✅ Daily schedule will be posted here every day at 00:00 UTC.")
+
+    elif action == "disable":
+        if guild_id in daily_channels:
+            del daily_channels[guild_id]
+            save_data()
+            await ctx.send("🗑️ Daily announcements disabled.")
+        else:
+            await ctx.send("ℹ️ Daily announcements were not enabled.")
+
+    else:
+        await ctx.send("❓ Usage: `!daily [enable|disable]`")
 
 
 @bot.command(name="help")
@@ -1191,17 +1219,25 @@ async def cmd_help(ctx: commands.Context):
     )
     embed.add_field(name="📡 RSS Feeds", value="━━━━━━━━━━━━━━━━━━", inline=False)
     embed.add_field(
-        name="!feed list", value="Show feeds and subscriptions", inline=True
+        name="!feed list", value="Show available feeds and subscriptions", inline=True
     )
     embed.add_field(
-        name="!feed enable <key>", value="Subscribe this channel to a feed", inline=True
+        name="!feed enable <name>",
+        value="Subscribe this channel to a feed",
+        inline=True,
     )
     embed.add_field(
-        name="!feed disable <key>", value="Unsubscribe from a feed", inline=True
+        name="!feed disable <name>", value="Unsubscribe from a feed", inline=True
     )
     embed.add_field(
-        name="Feed keys",
-        value="`japanese` · `sub` · `dub` · `chinese` · `manga` · `manhwa`",
+        name="Feeds",
+        value="Defined in `feeds.txt` (name|url per line).",
+        inline=False,
+    )
+    embed.add_field(name="📆 Daily", value="━━━━━━━━━━━━━━━━━━", inline=False)
+    embed.add_field(
+        name="!daily [enable|disable]",
+        value="Automatically post today's schedule at 00:00 UTC in this channel.",
         inline=False,
     )
     await ctx.send(embed=embed)
@@ -1214,57 +1250,135 @@ async def cmd_help(ctx: commands.Context):
 
 @tasks.loop(minutes=5)
 async def poll_rss_feeds():
+    """Check all enabled feeds for new entries and post those less than 24h old."""
     active: dict[str, list[int]] = {}
-    for subs in feed_subscriptions.values():
-        for feed_key, channel_id in subs.items():
-            active.setdefault(feed_key, []).append(channel_id)
+    for guild_id, subs in feed_subscriptions.items():
+        for feed_name, channel_id in subs.items():
+            active.setdefault(feed_name, []).append(channel_id)
 
     if not active:
+        log.debug("RSS poll: no active subscriptions")
         return
 
-    loop = asyncio.get_event_loop()
-    for feed_key, channel_ids in active.items():
-        try:
-            feed = await loop.run_in_executor(
-                None, feedparser.parse, RSS_FEEDS[feed_key]["url"]
-            )
-        except Exception as exc:
-            log.warning("RSS fetch error for %s: %s", feed_key, exc)
-            continue
+    now = datetime.now(timezone.utc)
+    something_new = False
 
-        new_entries = []
-        for entry in feed.entries:
-            eid = entry.get("id") or entry.get("link") or entry.get("title")
-            if eid and eid not in seen_entries[feed_key]:
+    async with aiohttp.ClientSession() as session:
+        for feed_name, channel_ids in active.items():
+            url = RSS_FEEDS.get(feed_name)
+            if not url:
+                log.warning("Feed %s has no URL, skipping", feed_name)
+                continue
+
+            try:
+                async with session.get(url, timeout=30) as resp:
+                    if resp.status != 200:
+                        log.warning("Feed %s returned HTTP %d", feed_name, resp.status)
+                        continue
+                    text = await resp.text()
+                    feed = feedparser.parse(text)
+            except Exception as exc:
+                log.warning("Error fetching feed %s: %s", feed_name, exc)
+                continue
+
+            feed_key = url
+            seen_entries.setdefault(feed_key, set())
+
+            for entry in feed.entries:
+                eid = entry.get("id") or entry.get("link") or entry.get("title")
+                if not eid:
+                    log.debug("Skipping entry without ID in %s", feed_name)
+                    continue
+
+                if eid in seen_entries[feed_key]:
+                    continue
+
                 seen_entries[feed_key].add(eid)
-                new_entries.append(entry)
+                something_new = True
 
-        for entry in reversed(new_entries):
-            embed = make_rss_embed(entry, feed_key)
-            for channel_id in channel_ids:
-                channel = bot.get_channel(channel_id)
-                if channel:
-                    try:
-                        await channel.send(embed=embed)
-                    except (discord.Forbidden, discord.HTTPException) as exc:
-                        log.warning("RSS send error to %s: %s", channel_id, exc)
+                pub_date = parse_entry_date(entry)
+                if pub_date is None:
+                    log.debug("Entry %s has no valid date – skipping", eid)
+                    continue
+
+                age = now - pub_date
+                if age > timedelta(hours=24):
+                    log.debug("Entry %s is older than 24h (%s) – not posting", eid, age)
+                    continue
+
+                image_url = extract_image_from_entry(entry)
+                embed = make_rss_embed(entry, feed_name, image_url)
+
+                for channel_id in channel_ids:
+                    channel = bot.get_channel(channel_id)
+                    if channel:
+                        try:
+                            await channel.send(embed=embed)
+                            log.debug(
+                                "Sent RSS %s (entry %s) to channel %s",
+                                feed_name,
+                                eid,
+                                channel_id,
+                            )
+                        except (discord.Forbidden, discord.HTTPException) as exc:
+                            log.warning("RSS send error to %s: %s", channel_id, exc)
+
+    if something_new:
+        save_data()
 
 
 @poll_rss_feeds.before_loop
 async def before_poll():
     await bot.wait_until_ready()
-    log.info("Seeding RSS seen-entries cache…")
-    loop = asyncio.get_event_loop()
-    for feed_key, info in RSS_FEEDS.items():
+    load_data()
+    load_feeds_from_file()
+    log.info("RSS poller ready. %d feeds available.", len(RSS_FEEDS))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Daily announcement task
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@tasks.loop(time=datetime_time(hour=0, minute=0, tzinfo=timezone.utc))
+async def daily_announcement():
+    log.info("Running daily announcement task")
+    if not daily_channels:
+        return
+
+    async with aiohttp.ClientSession() as session:
+        shows = await fetch_timetable(session, "sub")
+
+    if not shows:
+        log.warning("Daily announcement: no timetable data")
+        return
+
+    today = datetime.now(timezone.utc).date()
+    todays_shows = filter_by_date(shows, today)
+
+    if not todays_shows:
+        log.info("Daily announcement: no shows today")
+        return
+
+    embeds = make_list_embeds(
+        todays_shows,
+        f"📅 **Daily Anime — {today.strftime('%A, %B %d %Y')}** ({len(todays_shows)} releases)",
+        EMBED_COLOUR,
+    )
+
+    for guild_id, channel_id in list(daily_channels.items()):
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            del daily_channels[guild_id]
+            save_data()
+            continue
+
         try:
-            feed = await loop.run_in_executor(None, feedparser.parse, info["url"])
-            for entry in feed.entries:
-                eid = entry.get("id") or entry.get("link") or entry.get("title")
-                if eid:
-                    seen_entries[feed_key].add(eid)
-        except Exception as exc:
-            log.warning("RSS seed error for %s: %s", feed_key, exc)
-    log.info("RSS seed complete.")
+            for i in range(0, len(embeds), EMBEDS_PER_MESSAGE):
+                await channel.send(embeds=embeds[i : i + EMBEDS_PER_MESSAGE])
+            log.debug("Daily announcement sent to guild %s", guild_id)
+        except Exception as e:
+            log.error("Failed to send daily announcement to %s: %s", guild_id, e)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1276,6 +1390,7 @@ async def before_poll():
 async def on_ready():
     log.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
     poll_rss_feeds.start()
+    daily_announcement.start()
 
 
 @bot.event
