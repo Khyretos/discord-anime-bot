@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
+COPY feeds.txt .
 
 # Exposes the OAuth2 callback server port
 EXPOSE 8080
